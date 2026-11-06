@@ -51,6 +51,7 @@ namespace MediaController
         private readonly object _stateLock = new();
         private CancellationTokenSource _connectionLifetime = new();
         private GattDeviceService? _amsService;
+        private GattSession? _gattSession;
 
         public event EventHandler<BleMediaInfoEventArgs>? OnMediaUpdated;
         public event EventHandler<string>? OnStatusMessage;
@@ -113,6 +114,8 @@ namespace MediaController
             _entityUpdateChar = null;
             _amsService?.Dispose();
             _amsService = null;
+            _gattSession?.Dispose();
+            _gattSession = null;
         }
 
         private async void BleDev_ConnectionStatusChanged(BluetoothLEDevice sender, object args)
@@ -186,6 +189,25 @@ namespace MediaController
                 entered = true;
                 token.ThrowIfCancellationRequested();
                 if (IsAmsConnected) return true;
+
+                // 建立或維持 GattSession，確保 Windows 保持與裝置的 BLE 連線不被休眠切斷
+                if (_gattSession == null)
+                {
+                    try
+                    {
+                        var session = await GattSession.FromDeviceIdAsync(bleDev.BluetoothDeviceId);
+                        if (session != null)
+                        {
+                            session.MaintainConnection = true;
+                            _gattSession = session;
+                            Logger.Log("[GATT] 已啟用 GattSession.MaintainConnection");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Log($"[GATT] 啟用 GattSession 略過: {ex.Message}");
+                    }
+                }
                 for (int attempt = 1; attempt <= 3; attempt++)
                 {
                     GattDeviceService? service = null;
@@ -193,8 +215,15 @@ namespace MediaController
                     try
                     {
                         Logger.Log($"[GATT] 讀取 '{bleDev.Name}' AMS 服務 (嘗試 {attempt}/3)...");
-                        var services = await GattStepAsync("查詢 AMS 服務", () =>
-                            bleDev.GetGattServicesForUuidAsync(AmsServiceUuid, BluetoothCacheMode.Uncached), token);
+                        // 優先使用快取查詢以避免低功耗待機時拋出 Unreachable，快取無效時再嘗試空中查詢
+                        var services = await GattStepAsync("查詢 AMS 服務 (快取)", () =>
+                            bleDev.GetGattServicesForUuidAsync(AmsServiceUuid, BluetoothCacheMode.Cached), token);
+                        if (services.Status != GattCommunicationStatus.Success || services.Services.Count == 0)
+                        {
+                            Logger.Log($"[GATT] 快取未命中 AMS 服務 ({services.Status})，嘗試非快取空中查詢...");
+                            services = await GattStepAsync("查詢 AMS 服務 (空中)", () =>
+                                bleDev.GetGattServicesForUuidAsync(AmsServiceUuid, BluetoothCacheMode.Uncached), token);
+                        }
                         Logger.Log($"[GATT] AMS 服務結果: {services.Status}, 數量: {services.Services.Count}");
                         // Dispose even results returned just before a disconnect.
                         foreach (var candidate in services.Services)
@@ -204,8 +233,14 @@ namespace MediaController
                         }
                         RequireSuccess(services.Status, "查詢 AMS 服務");
                         if (service == null) throw new InvalidOperationException("裝置未提供 AMS 服務");
-                        var chars = await GattStepAsync("查詢 AMS 特徵碼", () =>
-                            service.GetCharacteristicsAsync(BluetoothCacheMode.Uncached), token);
+                        var chars = await GattStepAsync("查詢 AMS 特徵碼 (快取)", () =>
+                            service.GetCharacteristicsAsync(BluetoothCacheMode.Cached), token);
+                        if (chars.Status != GattCommunicationStatus.Success || chars.Characteristics.Count == 0)
+                        {
+                            Logger.Log($"[GATT] 快取未命中 AMS 特徵碼 ({chars.Status})，嘗試非快取空中查詢...");
+                            chars = await GattStepAsync("查詢 AMS 特徵碼 (空中)", () =>
+                                service.GetCharacteristicsAsync(BluetoothCacheMode.Uncached), token);
+                        }
                         Logger.Log($"[GATT] AMS 特徵碼結果: {chars.Status}, 數量: {chars.Characteristics.Count}");
                         RequireSuccess(chars.Status, "查詢 AMS 特徵碼");
                         var remote = chars.Characteristics.FirstOrDefault(c => c.Uuid == RemoteCommandCharUuid);
@@ -229,8 +264,7 @@ namespace MediaController
                         lock (_stateLock)
                         {
                             token.ThrowIfCancellationRequested();
-                            if (!ReferenceEquals(bleDev, _connectedBleDevice) ||
-                                bleDev.ConnectionStatus != BluetoothConnectionStatus.Connected)
+                            if (!ReferenceEquals(bleDev, _connectedBleDevice))
                                 throw new OperationCanceledException("連線已失效");
                             _amsService = service;
                             _remoteCommandChar = remote;
