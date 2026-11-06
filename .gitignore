@@ -17,3 +17,6 @@ publish/
 
 # Logs
 *.log
+
+# Local output
+output/

@@ -43,6 +43,7 @@ namespace MediaController
         private BitmapImage? _currentBleArtwork;
         private BleMediaInfoEventArgs? _latestBleMediaInfo;
         private int _artworkRequestVersion;
+        private int _bleRetryCounter;
 
         public event EventHandler<MediaInfoEventArgs>? MediaInfoUpdated;
         public event EventHandler<bool>? PlaybackStateUpdated;
@@ -68,14 +69,6 @@ namespace MediaController
                     Logger.Log("[Init] GSMTC SessionManager 請求成功！");
                     _manager.CurrentSessionChanged += (s, e) => RefreshActiveSession();
                     _manager.SessionsChanged += (s, e) => RefreshActiveSession();
-
-                    _pollTimer = new DispatcherTimer
-                    {
-                        Interval = TimeSpan.FromMilliseconds(2000)
-                    };
-                    _pollTimer.Tick += (s, e) => RefreshActiveSession();
-                    _pollTimer.Start();
-
                     RefreshActiveSession();
                 }
             }
@@ -83,6 +76,30 @@ namespace MediaController
             {
                 Logger.Log($"[Init] GSMTC 異常: {ex.Message}");
             }
+
+            // 啟動定時輪詢：一方面更新 GSMTC，另一方面在 AMS 未連線時自動重試配對
+            _pollTimer = new DispatcherTimer
+            {
+                Interval = TimeSpan.FromMilliseconds(2000)
+            };
+            _pollTimer.Tick += (s, e) =>
+            {
+                RefreshActiveSession();
+                if (!_btManager.IsAmsConnected)
+                {
+                    _bleRetryCounter++;
+                    // 每 6 秒 (3 次計時) 自動嘗試掃描與連線一次 BLE
+                    if (_bleRetryCounter % 3 == 0)
+                    {
+                        _ = _btManager.ScanAndConnectPairedDevicesAsync();
+                    }
+                }
+                else
+                {
+                    _bleRetryCounter = 0;
+                }
+            };
+            _pollTimer.Start();
         }
 
         private async void BtManager_OnMediaUpdated(object? sender, BleMediaInfoEventArgs e)
